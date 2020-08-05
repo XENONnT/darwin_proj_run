@@ -17,7 +17,7 @@ from binference.template_source import TemplateSource
 #from binference.utils import read_neyman_threshold
 
 
-from blueice.likelihood import UnbinnedLogLikelihood, LogAncillaryLikelihood, LogLikelihoodSum
+from blueice.likelihood import UnbinnedLogLikelihood, LogAncillaryLikelihood, LogLikelihoodSum, BinnedLogLikelihood
 from blueice.inference import bestfit_scipy, one_parameter_interval
 
 from inference_interface import toydata_to_file, toydata_from_file, structured_array_to_dict, dict_to_structured_array
@@ -50,6 +50,7 @@ class SpectrumTemplateSource(bi.HistogramPdfSource):
         named_parameters: list of config settings to pass to .format on histname and filename 
     """
     def build_histogram(self):
+        print("building a hist")
         format_dict = {k: self.config[k] for k in self.config.get('named_parameters', [])}
         templatename = self.config['templatename'].format(**format_dict)
         histname = self.config['histname'].format(**format_dict)
@@ -71,6 +72,7 @@ class SpectrumTemplateSource(bi.HistogramPdfSource):
         ediffs =         (ebins[1::] - ebins[0:-1])
         h.histogram = h.histogram * (spectrum(ecenters)*ediffs)[:,None,None]
         h = h.sum(axis=0) #remove energy-axis
+        print("source","mu ",h.n)
 
 
         for sa in slice_args:
@@ -226,8 +228,7 @@ parameter_uncerts = dict(
 class InferenceObject:
     def __init__(self, wimp_mass = 50, livetime = 1.,
             ll_config_overrides={},
-            limit_threshold = lambda x,dummy:0.5*sps.chi2(1).isf(0.1),
-            **kwargs):
+            limit_threshold = lambda x,dummy:0.5*sps.chi2(1).isf(0.1), binned = False, **kwargs):
         
         signal_spectrum = lambda x: wr.rate_wimp_std(x,mw=wimp_mass,sigma_nucleon=1e-45) / (365.*1000.)
         signal_config = dict(
@@ -235,14 +236,18 @@ class InferenceObject:
             label= 'WIMP events',
             name= 'signal',
             spectrum=signal_spectrum,
-            templatename= '/Users/kdund/Desktop/Darwin_projection/darwin_proj_run/darwin_likelihood/data/NEST_dummyresponse.hdf5',        never_save_to_cache=True,
+            templatename= get_resource_filename("NEST_dummyresponse.hdf5"),
+            never_save_to_cache=True,
             dont_hash_settings = ["spectrum"],
         )
         self.limit_threshold = limit_threshold
         ll_config = get_likelihood_config(exposure = livetime, signal_config=signal_config)
         ll_config.update(ll_config_overrides)
-        ll_config["livetime_days"] = livetime
+        #ll_config["livetime_days"] = livetime
+        print("livetime",ll_config["livetime_days"])
         ll = UnbinnedLogLikelihood(ll_config)
+        if binned:
+            ll = BinnedLogLikelihood(ll_config)
 
         for parameter in ["ernusun","nrnusun","xe136","atmnu","snnu"]:
             ll.add_rate_parameter(parameter,
