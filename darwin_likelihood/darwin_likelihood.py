@@ -30,6 +30,19 @@ can_check_binning = True
 minimize_kwargs = {'method': 'Powell', 'options': {'maxiter': 10000000}}
 science_slice_args = [{'slice_axis': 0, 'sum_axis': False, 'slice_axis_limits': [3.01, 99.9]}]
 
+def cut_data(ll,data):
+    asp = ll.base_model.config["analysis_space"]
+    cuts = np.ones(len(data),dtype=bool)
+    for a in asp:
+        cn = a[0]
+        cd,cu = a[1].min(), a[1].max()
+        cuts *= (cd<data[cn]) & (data[cn]<cu)
+    sal = ll.base_model.config.get("sum_axis_limits",[])
+    for cn, cd,cu in sal: 
+        print(cn,cd,cu)
+        cuts *= (cd<data[cn]) & (data[cn]<cu)
+    return data[cuts]
+
 def get_spectrum(fn):
     """
         Translates bbf-style JSON files to spectra. 
@@ -143,6 +156,7 @@ class SpectrumTemplateSource(bi.HistogramPdfSource):
         if self.config.get('in_events_per_bin'):
             h.histogram /= h.bin_volumes()
         self.events_per_day = (h.histogram * self._bin_volumes).sum()
+        print("source evt per day is",self.events_per_day)
 
         
         # ... and finally to probability density
@@ -173,6 +187,7 @@ def get_likelihood_config(exposure=1.,signal_config={},**kwargs):
                 templatename = get_resource_filename("NEST_dummyresponse.hdf5"),
                 histname="er",
                 spectrum=get_resource_filename("spectra/SolarNeutrinoFEASpectrum.json"),
+                in_events_per_bin=True,
             ),
             dict(
                 name="nrnusun",
@@ -180,6 +195,7 @@ def get_likelihood_config(exposure=1.,signal_config={},**kwargs):
                 templatename = get_resource_filename("NEST_dummyresponse.hdf5"),
                 histname="nr",
                 spectrum=get_resource_filename("spectra/Solar_CNNSSpectrum.json"),
+                in_events_per_bin=True,
             ),
             dict(
                 name="xe136",
@@ -187,6 +203,7 @@ def get_likelihood_config(exposure=1.,signal_config={},**kwargs):
                 templatename = get_resource_filename("NEST_dummyresponse.hdf5"),
                 histname="er",
                 spectrum=get_resource_filename("spectra/Xe136Spectrum.json"),
+                in_events_per_bin=True,
             ),
             dict(
                 name="atmnu",
@@ -194,6 +211,7 @@ def get_likelihood_config(exposure=1.,signal_config={},**kwargs):
                 templatename = get_resource_filename("NEST_dummyresponse.hdf5"),
                 histname="nr",
                 spectrum=get_resource_filename("spectra/Atm_CNNSSpectrum.json"),
+                in_events_per_bin=True,
             ),
             dict(
                 name="snnu",
@@ -201,6 +219,7 @@ def get_likelihood_config(exposure=1.,signal_config={},**kwargs):
                 templatename = get_resource_filename("NEST_dummyresponse.hdf5"),
                 histname="nr",
                 spectrum=get_resource_filename("spectra/DSN_CNNSSpectrum.json"),
+                in_events_per_bin=True,
             ),
             signal_config,
             ]
@@ -226,13 +245,27 @@ parameter_uncerts = dict(
         )
 
 class InferenceObject:
-    def __init__(self, wimp_mass = 50, livetime = 1.,
+    def __init__(self, wimp_mass = 50,
+            interaction = "SI",
+            livetime = 1.,
             ll_config_overrides={},
-            limit_threshold = lambda x,dummy:0.5*sps.chi2(1).isf(0.1), binned = False, **kwargs):
+            limit_threshold = lambda x,dummy:0.5*sps.chi2(1).isf(0.1), binned = False,
+            toydata_file = None,
+            toydata_mode = "write",
+            signaltype="nr",
+            **kwargs):
         
-        signal_spectrum = lambda x: wr.rate_wimp_std(x,mw=wimp_mass,sigma_nucleon=1e-45) / (365.*1000.)
+        if interaction in ["SI","SD_n_central","SD_p_central"]:
+            signal_spectrum = lambda x: wr.rate_wimp_std(x,mw=wimp_mass,sigma_nucleon=1e-45,interaction = interaction) / (365.*1000.)
+        elif interaction in "line":
+            signal_spectrum = lambda x:sps.norm(wimp_mass,0.01*wimp_mass).pdf(x)
+        else:
+            fname="/home/kmoraa/scratch-midway/SR1WimpPion/bbf_signal_generation/dRdE_wimp_pion_{:d}GeV_10-45.csv".format(int(wimp_mass))
+            print(fname)
+            f = np.loadtxt(fname,delimiter=",")
+            signal_spectrum = interp1d(f[:,0],f[:,1],bounds_error=False,fill_value=0.)
         signal_config = dict(
-            histname= 'nr',
+            histname= signaltype,
             label= 'WIMP events',
             name= 'signal',
             spectrum=signal_spectrum,
@@ -241,6 +274,9 @@ class InferenceObject:
             dont_hash_settings = ["spectrum"],
         )
         self.limit_threshold = limit_threshold
+        if limit_threshold is None:
+            self.limit_threshold = lambda x,dummy:0.5*sps.chi2(1).isf(0.1)
+        print("limit threshold is",type(limit_threshold))
         ll_config = get_likelihood_config(exposure = livetime, signal_config=signal_config)
         ll_config.update(ll_config_overrides)
         #ll_config["livetime_days"] = livetime
@@ -264,8 +300,24 @@ class InferenceObject:
         ll.set_data(dummy_data)
 
         self.lls = [ll]
-        self.rgs =[simulate_interpolated(ll) for ll in self.lls]
+        self.rgs =[simulate_interpolated(ll,binned=binned) for ll in self.lls]
         self.ll = LogLikelihoodSum(self.lls)
+
+        self.dataset_names = ["ll_sci","ancillary_measurements","generate_args"]
+
+        self.toydata_mode = toydata_mode
+        self.toydata_file = toydata_file
+        if toydata_mode =="none":
+            self.rgs =[simulate_interpolated(ll,binned=binned) for ll in self.lls]
+        elif toydata_mode =="write":
+            self.rgs =[simulate_interpolated(ll,binned=binned) for ll in self.lls]
+            self.datasets_array = []
+            #toydata_to_file(toydata_file, self.datasets_array, self.dataset_names, overwrite_existing_file = True)
+        elif toydata_mode =="read":
+            self.datasets_array, dataset_names = toydata_from_file(toydata_file)
+            assert self.dataset_names == dataset_names
+            self.toydata_index = 0
+
 
     def simulate_and_assign_data(self, generate_args = {}):
         datas = [rg.simulate(**generate_args) for rg in self.rgs]
@@ -278,6 +330,31 @@ class InferenceObject:
             parameter_uncert = generate_args.get(parameter_name+"_uncert",parameter_uncerts[parameter_name])
             parameter_mean = generate_args.get(parameter_name+"_rate_multiplier",1)
             parameter_meas = max(0,sps.norm(parameter_mean, parameter_uncert).rvs())
+            parameter_meas = generate_args.get(parameter_name+"_meas",parameter_meas)
+            self.lls[0].rate_parameters[parameter_name]=sps.norm(parameter_meas,parameter_uncert).logpdf
+    def simulate_and_assign_data(self, generate_args = {}):
+        datas = [rg.simulate(**generate_args) for rg in self.rgs]
+        for data, ll in zip(datas, self.lls):
+            ll.set_data(data)
+        return datas
+
+    def simulate_and_assign_measurements(self,generate_args={}):
+
+        ret = dict()
+        for parameter_name in ["ernusun","nrnusun","xe136","atmnu","snnu"]:
+            parameter_uncert = generate_args.get(parameter_name+"_uncert",parameter_uncerts[parameter_name])
+            parameter_mean = generate_args.get(parameter_name+"_rate_multiplier",1)
+            parameter_meas = max(0,sps.norm(parameter_mean, parameter_uncert).rvs())
+            self.lls[0].rate_parameters[parameter_name]=sps.norm(parameter_meas,parameter_uncert).logpdf
+            ret[parameter_name]= parameter_meas
+            #log_priors[pn] = sps.norm(meas,uncert).logpdf
+            ret[parameter_name+"_uncert"] = parameter_uncert
+        return ret
+    def assign_measurements(self, ancillary_measurements):
+
+        for parameter_name in ["ernusun","nrnusun","xe136","atmnu","snnu"]:
+            parameter_uncert = ancillary_measurements.get(parameter_name+"_uncert",parameter_uncerts[parameter_name] )
+            parameter_meas = ancillary_measurements.get(parameter_name,1. )
             self.lls[0].rate_parameters[parameter_name]=sps.norm(parameter_meas,parameter_uncert).logpdf
 
     def llr(self, extra_args={}, extra_args_null={"signal_rate_multiplier":0.},guess={}):
@@ -317,9 +394,34 @@ class InferenceObject:
         return dl, ul
 
 
-    def toy_simulation(self,generate_args={}, extra_args=[{},{"signal_rate_multiplier":0.}], guess={},compute_confidence_interval = False, confidence_interval_args = {}):
-        self.simulate_and_assign_data(generate_args=generate_args)
-        self.simulate_and_assign_measurements(generate_args=generate_args)
+    def toy_simulation(self,generate_args={}, extra_args=[{},{"signal_rate_multiplier":0.}],guess={},compute_confidence_interval = False, confidence_interval_args = {},**kwargs):
+
+
+        if self.toydata_mode == "read":
+            datas = self.datasets_array[self.toydata_index]
+
+            self.toydata_index += 1
+            self.assign_data(datas)
+            # print("ancillary measurement is", datas[-2], datas[-2].dtype)
+            # print("ancillary measurement length",len(datas[-2]))
+            ancillary_measurements = structured_array_to_dict(datas[-2])
+            generate_args = {}
+            # print("ancillary measurement",ancillary_measurements)
+            self.assign_measurements(ancillary_measurements)
+        else:
+            datas = self.simulate_and_assign_data(generate_args=generate_args)
+            ancillary_measurements =self.simulate_and_assign_measurements(generate_args=generate_args)
+            if self.toydata_mode =="write":
+                datas.append(dict_to_structured_array(ancillary_measurements))
+                if 0<len(generate_args):
+                    datas.append(dict_to_structured_array(generate_args))
+                else:
+                    datas.append(dict_to_structured_array({"alldefault":0}))
+
+                self.datasets_array.append(datas)
+
+
+
         self.ll = LogLikelihoodSum(self.lls)
         ress = []
         extra_args_runs = extra_args
@@ -357,6 +459,15 @@ class InferenceObject:
         ret += list(self.ll.shape_parameters.keys())
         ret +=["ll", "dl",  "ul"]
         return ret
+
+    def write_toydata(self):
+        toydata_to_file(self.toydata_file, datasets_array = self.datasets_array, dataset_names = self.dataset_names, overwrite_existing_file=True)
+
+    def assign_data(self,datas):
+        for data, ll in zip(datas, self.lls):
+
+            d = cut_data(ll,data)
+            ll.set_data(d)
 
 
 
